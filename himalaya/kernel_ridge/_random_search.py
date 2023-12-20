@@ -21,9 +21,9 @@ def solve_multiple_kernel_ridge_random_search(
         Xs=None, local_alpha=True, jitter_alphas=False, random_state=None,
         n_targets_batch=None, n_targets_batch_refit=None, n_alphas_batch=None,
         progress_bar=True, Ks_in_cpu=False, conservative=False, Y_in_cpu=False,
-        diagonalize_method="eigh", return_alphas=False):
+        diagonalize_method="eigh", return_alphas=False, compute_r2_os=True):
+    
     """Solve multiple kernel ridge regression using random search.
-
     Parameters
     ----------
     Ks : array of shape (n_kernels, n_samples, n_samples)
@@ -209,13 +209,19 @@ def solve_multiple_kernel_ridge_random_search(
             K = backend.to_gpu(K, device=device)
         else:
             K = (gamma[:, None, None] * Ks).sum(0)
-
+            
         if jitter_alphas:
             noise = backend.asarray_like(random_generator.rand(), alphas)
             alphas = given_alphas * (10 ** (noise - 0.5))
 
         scores = backend.zeros_like(gammas,
                                     shape=(n_splits, len(alphas), n_targets))
+        scores_intercept_only = backend.zeros_like(gammas,
+                                    shape=(n_splits, len(alphas), n_targets))
+        
+        split_size = []
+        
+        
         for jj, (train, test) in enumerate(cv.split(K)):
             train = backend.to_gpu(train, device=device)
             test = backend.to_gpu(test, device=device)
@@ -224,6 +230,9 @@ def solve_multiple_kernel_ridge_random_search(
                 centerer = KernelCenterer()
                 Ktrain = centerer.fit_transform(Ktrain)
                 Ktest = centerer.transform(Ktest)
+                
+            # add size of split for computing pooled out of sample R2 
+            split_size.append(Ktest.shape[0])
 
             for matrix, alpha_batch in _decompose_kernel_ridge(
                     Ktrain=Ktrain, alphas=alphas, Ktest=Ktest,
@@ -250,6 +259,9 @@ def solve_multiple_kernel_ridge_random_search(
                         warnings.filterwarnings("ignore", category=UserWarning)
                         scores[jj, alpha_batch, batch] = score_func(
                             Ytest, predictions)
+                        if fit_intercept:
+                            scores_intercept_only[jj, alpha_batch, batch] = score_func(Ytest, 
+                                                                    backend.zeros_like(predictions))
                         # n_alphas_batch, n_targets_batch = score.shape
 
                 # make small alphas impossible to select
@@ -261,9 +273,9 @@ def solve_multiple_kernel_ridge_random_search(
 
         # select best alphas
         alphas_argmax, cv_scores_ii = _select_best_alphas(
-            scores, alphas, local_alpha, conservative)
+            scores, alphas, local_alpha, conservative, split_size, 
+            scores_intercept_only, compute_r2_os)
         cv_scores[ii, :] = backend.to_cpu(cv_scores_ii)
-
         # update best_gammas and best_alphas
         epsilon = np.finfo(_dtype_to_str(dtype)).eps
         if local_alpha:
@@ -365,7 +377,8 @@ def solve_multiple_kernel_ridge_random_search(
     return results
 
 
-def _select_best_alphas(scores, alphas, local_alpha, conservative):
+def _select_best_alphas(scores, alphas, local_alpha, conservative, split_size=None,  
+                        scores_intercept=None, compute_r2_os=False):
     """Helper to select the best alphas
 
     Parameters
@@ -380,6 +393,12 @@ def _select_best_alphas(scores, alphas, local_alpha, conservative):
         If True, when selecting the hyperparameter alpha, take the largest one
         that is less than one standard deviation away from the best.
         If False, take the best.
+    split_size: list
+        Size of validation splits
+    scores_intercdpt: array of shape (n_splits, n_alphas, n_targets)
+        Cross validation scores from predicting training mean.
+    compute_r2_os: bool
+        If true, compute out of sample r2.
 
     Returns
     -------
@@ -388,12 +407,23 @@ def _select_best_alphas(scores, alphas, local_alpha, conservative):
     best_scores_mean : array of shape (n_targets, )
         Scores, averaged over splits, and maximized over alphas.
     """
+    
     backend = get_backend()
-
-    # average scores over splits
-    scores_mean = backend.mean_float64(scores, axis=0)
-    # add epsilon slope to select larger alphas if scores are equal
-    scores_mean += (backend.log(alphas) * 1e-10)[:, None]
+    
+    if compute_r2_os:
+        split_size_tf = backend.asarray(split_size)/backend.sum(backend.asarray(split_size))
+        scores_weighted = scores.T*split_size_tf
+        scores_intercept_weighted = scores_intercept.T*split_size_tf
+        scores_mean = backend.sum(scores_weighted.T, axis=0)
+        scores_intercept_mean = backend.sum(scores_intercept_weighted.T, axis=0)
+        scores_mean = 1 - scores_mean/scores_intercept_mean
+        scores_mean[scores_intercept_mean==0] = 0
+        scores_mean += (backend.log(alphas) * 1e-10)[:, None]
+    else:
+        # average scores over splits
+        scores_mean = backend.mean_float64(scores, axis=0)
+        # add epsilon slope to select larger alphas if scores are equal
+        scores_mean += (backend.log(alphas) * 1e-10)[:, None]
 
     # compute the max over alphas
     axis = 0
@@ -518,7 +548,7 @@ def _decompose_kernel_ridge(Ktrain, alphas, Ktest=None, n_alphas_batch=None,
         If the decomposition leads to negative eigenvalues (wrongly emerging
         from float32 errors):
             - "error" raises an error.
-            - "zeros" replaces them with zeros.
+            - "zeros" remplaces them with zeros.
             - "nan" returns nans if the regularization does not compensate
                 twice the smallest negative value, else it ignores the problem.
 

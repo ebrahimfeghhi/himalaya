@@ -1,6 +1,7 @@
 import warnings
 import numbers
 import numpy as np
+import torch 
 from ..backend import get_backend
 from ..backend._utils import _dtype_to_str
 from ..progress_bar import bar
@@ -9,13 +10,8 @@ from ..validation import check_random_state
 from ..validation import check_cv
 from ..kernel_ridge import generate_dirichlet_samples
 from ..kernel_ridge._random_search import _select_best_alphas
+import copy
 
-'''
-1) In the original code, X was scaled by gamma and then this scaling was undone.
-This seems to lead to issues with SVD due to nans appearing from the scaling + 
-rescaling procedure. Modified this by first storing a copy of X, and reloading it
-after every gamma iteration. 
-'''
 
 def solve_group_ridge_random_search(
     Xs, Y, n_iter=100, concentration=[0.1,
@@ -23,7 +19,7 @@ def solve_group_ridge_random_search(
     score_func=l2_neg_loss, cv=5, return_weights=False, local_alpha=True,
     jitter_alphas=False, random_state=None, n_targets_batch=None,
     n_targets_batch_refit=None, n_alphas_batch=None, progress_bar=True,
-    conservative=False, Y_in_cpu=False, diagonalize_method="svd", warn=True):
+    conservative=False, Y_in_cpu=False, diagonalize_method="svd", warn=True, compute_r2_os=True):
     """Solve group ridge regression using random search on the simplex.
 
     Solve the group-regularized ridge regression::
@@ -104,17 +100,22 @@ def solve_group_ridge_random_search(
     intercept : array of shape (n_targets,)
         Intercept. Only returned when fit_intercept is True.
     """
+    
     backend = get_backend()
     n_spaces = len(Xs)
+    
     if isinstance(n_iter, int):
         gammas = generate_dirichlet_samples(n_samples=n_iter,
                                             n_kernels=n_spaces,
                                             concentration=concentration,
                                             random_state=random_state)
         gammas[0] = 1 / n_spaces
+        
     elif n_iter.ndim == 2:
+        
         gammas = n_iter
         assert gammas.shape[1] == n_spaces
+        
     else:
         raise ValueError("Unknown parameter n_iter=%r." % (n_iter, ))
 
@@ -164,8 +165,8 @@ def solve_group_ridge_random_search(
         n_targets_batch = n_targets
     if n_targets_batch_refit is None:
         n_targets_batch_refit = n_targets_batch
-    if n_alphas_batch is None:
-        n_alphas_batch = len(alphas)
+    #if n_alphas_batch is None:
+    #    n_alphas_batch = len(alphas)
 
     cv = check_cv(cv, Y)
     n_splits = cv.get_n_splits()
@@ -189,29 +190,35 @@ def solve_group_ridge_random_search(
 
     # initialize refit ridge weights
     refit_weights = None
+    
     if return_weights:
         refit_weights = backend.zeros_like(gammas,
                                            shape=(n_features, n_targets),
                                            device="cpu")
         
-        
     X_original = X_.clone().detach()
     save_nan_gamma = True
-
+    
     for ii, gamma in enumerate(
             bar(gammas, '%d random sampling with cv' % len(gammas),
                 use_it=progress_bar)):
-
+        
+        for kk in range(n_spaces):
+            X_[:, slices[kk]] *= backend.sqrt(gamma[kk])
+ 
         if jitter_alphas:
             noise = backend.asarray_like(random_generator.rand(), alphas)
             alphas = given_alphas * (10 ** (noise - 0.5))
 
         scores = backend.zeros_like(gammas,
                                     shape=(n_splits, len(alphas), n_targets))
+        scores_intercept_only = backend.zeros_like(gammas,
+                                    shape=(n_splits, len(alphas), n_targets))
         
-        for kk in range(n_spaces):
-            X_[:, slices[kk]] *= backend.sqrt(gamma[kk])
-            
+        split_size = []
+        
+        
+        
         for jj, (train, test) in enumerate(cv.split(X_)):
             
             train = backend.to_gpu(train, device=device)
@@ -219,29 +226,40 @@ def solve_group_ridge_random_search(
             Xtrain, Xtest = X_[train], X_[test]
 
             if fit_intercept:
-                Xtrain_mean = Xtrain.mean(0)
-                Xtrain = Xtrain - Xtrain_mean
-                Xtest = Xtest - Xtrain_mean
+                Xtrain_mean = X_[train].mean(0)
+                Xtrain = X_[train] - Xtrain_mean
+                Xtest = X_[test] - Xtrain_mean
+
+            if torch.any(torch.isnan(X_)) and save_nan_gamma:
+                torch.save(gamma, f'/home3/ebrahim/what-is-brainscore/debugging_him/gamma_nan.pt')
+                save_nan_gamma = False
+                
+            # add size of split for computing pooled out of sample R2 
+            split_size.append(Xtest.shape[0])
 
             for matrix, alpha_batch in _decompose_ridge(
                     Xtrain=Xtrain, alphas=alphas, negative_eigenvalues="nan",
                     n_alphas_batch=n_alphas_batch, method=diagonalize_method):
+    
                 # n_alphas_batch, n_features, n_samples_train = \
                 # matrix.shape
                 matrix = backend.matmul(Xtest, matrix)
+                
                 # n_alphas_batch, n_samples_test, n_samples_train = \
                 # matrix.shape
-
                 predictions = None
+                
                 for start in range(0, n_targets, n_targets_batch):
+                    
                     batch = slice(start, start + n_targets_batch)
                     Ytrain = backend.to_gpu(Y[:, batch][train], device=device)
                     Ytest = backend.to_gpu(Y[:, batch][test], device=device)
+                    
                     if fit_intercept:
                         Ytrain_mean = Ytrain.mean(0)
                         Ytrain = Ytrain - Ytrain_mean
                         Ytest = Ytest - Ytrain_mean
-
+        
                     predictions = backend.matmul(matrix, Ytrain)
                     # n_alphas_batch, n_samples_test, n_targets_batch = \
                     # predictions.shape
@@ -249,29 +267,36 @@ def solve_group_ridge_random_search(
                     with warnings.catch_warnings():
                         warnings.filterwarnings("ignore", category=UserWarning)
                         scores[jj, alpha_batch,
-                               batch] = score_func(Ytest, predictions)
+                            batch] = score_func(Ytest, predictions)
+                        # voxels are zero meaned in Y_train, so predict 0 to get intercept only
+                        # model score 
+                        if fit_intercept:
+                            scores_intercept_only[jj, alpha_batch, batch] = score_func(Ytest, 
+                                                                    backend.zeros_like(predictions))
                         # n_alphas_batch, n_targets_batch = score.shape
                     del Ytrain, Ytest
-
+                    
                 # make small alphas impossible to select
-                too_small_alphas = backend.isnan(matrix[:, 0, 0])
-                scores[jj, alpha_batch, :][too_small_alphas] = -1e5
-
+                #too_small_alphas = backend.isnan(matrix[:, 0, 0])
+                #scores[jj, alpha_batch, :][too_small_alphas] = -1e5
+                
                 del matrix, predictions
             del train, test, Xtrain, Xtest
-
-        # select best alphas
+                
+    
         alphas_argmax, cv_scores_ii = _select_best_alphas(
-            scores, alphas, local_alpha, conservative)
-        cv_scores[ii, :] = backend.to_cpu(cv_scores_ii)
+            scores, alphas, local_alpha, conservative, split_size, 
+            scores_intercept_only, compute_r2_os)
 
+        cv_scores[ii, :] = backend.to_cpu(cv_scores_ii)
+        
         # update best_gammas and best_alphas
         epsilon = np.finfo(_dtype_to_str(dtype)).eps
         mask = cv_scores_ii > current_best_scores + epsilon
         current_best_scores[mask] = cv_scores_ii[mask]
         best_gammas[:, mask] = gamma[:, None]
         best_alphas[mask] = alphas[alphas_argmax[mask]]
-
+        
         # compute primal or dual weights on the entire dataset (nocv)
         if return_weights:
             update_indices = backend.flatnonzero(mask)
@@ -283,20 +308,26 @@ def solve_group_ridge_random_search(
                 used_alphas = backend.unique(best_alphas[mask])
                 primal_weights = backend.zeros_like(
                     X_, shape=(n_features, len(update_indices)), device="cpu")
+                
+                if n_alphas_batch is not None:
+                    alphas_batch_refit = min(used_alphas, n_alphas_batch)
+                else:
+                    alphas_batch_refit = None
+                    
                 for matrix, alpha_batch in _decompose_ridge(
                         Xtrain=X_, alphas=used_alphas,
                         negative_eigenvalues="zeros",
-                        n_alphas_batch=min(len(used_alphas), n_alphas_batch),
+                        n_alphas_batch=alphas_batch_refit,
                         method=diagonalize_method):
 
                     for start in range(0, len(update_indices),
-                                       n_targets_batch_refit):
+                                        n_targets_batch_refit):
                         batch = slice(start, start + n_targets_batch_refit)
 
                         weights = backend.matmul(
                             matrix,
                             backend.to_gpu(Y[:, update_indices[batch]],
-                                           device=device))
+                                            device=device))
                         # used_n_alphas_batch, n_features, n_targets_batch = \
                         # weights.shape
 
@@ -328,21 +359,26 @@ def solve_group_ridge_random_search(
                     primal_weights[slices[kk]] *= backend.to_cpu(
                         backend.sqrt(gamma[kk]))
                 refit_weights[:, backend.to_cpu(mask)] = primal_weights
+                
                 del primal_weights
-
             del update_indices
         del mask
-        
+
+        #for kk in range(n_spaces):
+        #    X_[:, slices[kk]] /= backend.sqrt(gamma[kk])
         X_ = X_original.clone().detach()
 
     deltas = backend.log(best_gammas / best_alphas[None, :])
 
     if fit_intercept:
+        
         intercept = (backend.to_cpu(Y_offset) -
                      backend.to_cpu(X_offset) @ refit_weights
                      ) if return_weights else None
         return deltas, refit_weights, cv_scores, intercept
+    
     else:
+        
         return deltas, refit_weights, cv_scores
 
 
@@ -374,7 +410,7 @@ def _decompose_ridge(Xtrain, alphas, n_alphas_batch=None, method="svd",
         If the decomposition leads to negative eigenvalues (wrongly emerging
         from float32 errors):
             - "error" raises an error.
-            - "zeros" replaces them with zeros.
+            - "zeros" remplaces them with zeros.
             - "nan" returns nans if the regularization does not compensate
                 twice the smallest negative value, else it ignores the problem.
 
@@ -394,15 +430,20 @@ def _decompose_ridge(Xtrain, alphas, n_alphas_batch=None, method="svd",
 
     if method == "svd":
         # SVD: X = U @ np.diag(eigenvalues) @ Vt
-        U, eigenvalues, Vt = backend.svd(Xtrain, full_matrices=False)
+        try: 
+            U, eigenvalues, Vt = backend.svd(Xtrain, full_matrices=False)
+        except:
+            print("SVD FAILED")
+            U, eigenvalues, Vt = backend.svd(torch.zeros_like(Xtrain), full_matrices=False)
     else:
         raise ValueError("Unknown method=%r." % (method, ))
 
     for start in range(0, len(alphas), n_alphas_batch):
+
         batch = slice(start, start + n_alphas_batch)
 
         ev_weighting = eigenvalues / (alphas[batch, None] + eigenvalues ** 2)
-
+        
         # negative eigenvalues can emerge from incorrect kernels,
         # or from float32
         if eigenvalues[0] < 0:
@@ -423,11 +464,11 @@ def _decompose_ridge(Xtrain, alphas, n_alphas_batch=None, method="svd",
                                  (negative_eigenvalues, ))
 
         matrices = backend.matmul(Vt.T, ev_weighting[:, :, None] * U.T)
-
+        
         if use_alpha_batch:
             yield matrices, batch
         else:
-            return matrices, batch
+            yield matrices, batch
 
         del matrices
 
