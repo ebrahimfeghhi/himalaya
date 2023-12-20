@@ -1,8 +1,6 @@
 import warnings
 import numbers
-
 import numpy as np
-
 from ..backend import get_backend
 from ..backend._utils import _dtype_to_str
 from ..progress_bar import bar
@@ -12,6 +10,12 @@ from ..validation import check_cv
 from ..kernel_ridge import generate_dirichlet_samples
 from ..kernel_ridge._random_search import _select_best_alphas
 
+'''
+1) In the original code, X was scaled by gamma and then this scaling was undone.
+This seems to lead to issues with SVD due to nans appearing from the scaling + 
+rescaling procedure. Modified this by first storing a copy of X, and reloading it
+after every gamma iteration. 
+'''
 
 def solve_group_ridge_random_search(
     Xs, Y, n_iter=100, concentration=[0.1,
@@ -189,13 +193,14 @@ def solve_group_ridge_random_search(
         refit_weights = backend.zeros_like(gammas,
                                            shape=(n_features, n_targets),
                                            device="cpu")
+        
+        
+    X_original = X_.clone().detach()
+    save_nan_gamma = True
 
     for ii, gamma in enumerate(
             bar(gammas, '%d random sampling with cv' % len(gammas),
                 use_it=progress_bar)):
-
-        for kk in range(n_spaces):
-            X_[:, slices[kk]] *= backend.sqrt(gamma[kk])
 
         if jitter_alphas:
             noise = backend.asarray_like(random_generator.rand(), alphas)
@@ -203,15 +208,20 @@ def solve_group_ridge_random_search(
 
         scores = backend.zeros_like(gammas,
                                     shape=(n_splits, len(alphas), n_targets))
+        
+        for kk in range(n_spaces):
+            X_[:, slices[kk]] *= backend.sqrt(gamma[kk])
+            
         for jj, (train, test) in enumerate(cv.split(X_)):
+            
             train = backend.to_gpu(train, device=device)
             test = backend.to_gpu(test, device=device)
             Xtrain, Xtest = X_[train], X_[test]
 
             if fit_intercept:
-                Xtrain_mean = X_[train].mean(0)
-                Xtrain = X_[train] - Xtrain_mean
-                Xtest = X_[test] - Xtrain_mean
+                Xtrain_mean = Xtrain.mean(0)
+                Xtrain = Xtrain - Xtrain_mean
+                Xtest = Xtest - Xtrain_mean
 
             for matrix, alpha_batch in _decompose_ridge(
                     Xtrain=Xtrain, alphas=alphas, negative_eigenvalues="nan",
@@ -322,9 +332,8 @@ def solve_group_ridge_random_search(
 
             del update_indices
         del mask
-
-        for kk in range(n_spaces):
-            X_[:, slices[kk]] /= backend.sqrt(gamma[kk])
+        
+        X_ = X_original.clone().detach()
 
     deltas = backend.log(best_gammas / best_alphas[None, :])
 

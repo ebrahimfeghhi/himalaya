@@ -545,9 +545,10 @@ class GroupRidgeCV(_BaseRidge):
             If parameter split is True, the array is of shape
             (n_groups, n_samples,) or (n_groups, n_samples, n_targets).
         """
+        
         backend = get_backend()
         check_is_fitted(self)
-
+        
         Xs = self._split_groups(X, dtype=self.dtype_, check=True)
 
         n_features = sum(Xi.shape[1] for Xi in Xs)
