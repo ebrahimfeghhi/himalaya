@@ -149,6 +149,10 @@ def solve_multiple_kernel_ridge_random_search(
         n_targets_batch_refit = n_targets_batch
     if n_alphas_batch is None:
         n_alphas_batch = len(alphas)
+        
+    patience = 0
+    patience_limit = 100
+    performance_diff_tracker = []
 
     cv = check_cv(cv, Y)
     n_splits = cv.get_n_splits()
@@ -276,6 +280,7 @@ def solve_multiple_kernel_ridge_random_search(
             scores, alphas, local_alpha, conservative, split_size, 
             scores_intercept_only, compute_r2_os)
         cv_scores[ii, :] = backend.to_cpu(cv_scores_ii)
+
         # update best_gammas and best_alphas
         epsilon = np.finfo(_dtype_to_str(dtype)).eps
         if local_alpha:
@@ -285,10 +290,26 @@ def solve_multiple_kernel_ridge_random_search(
             update = cv_scores_ii.mean() > current_best_scores.mean() + epsilon
             mask = backend.full_like(cv_scores_ii, fill_value=update,
                                      dtype=bool)
+            
+        # store mean of current_best_scores across voxels
+        # to track how much improvement is occurring 
+        current_best_scores_avg = current_best_scores.mean()
+        
         current_best_scores[mask] = cv_scores_ii[mask]
         best_gammas[:, mask] = gamma[:, None]
         best_alphas[mask] = alphas[alphas_argmax[mask]]
-
+        
+        # keep track of when the difference in performance is leveling off
+        current_best_scores_updated_avg = current_best_scores.mean()
+        performance_difference = float(current_best_scores_updated_avg) - float(current_best_scores_avg)
+        
+        if performance_difference < 1e-3: # using an arbitrary, small threshold
+            patience += 1
+        else:
+            patience = 0 
+            
+        performance_diff_tracker.append(round(float(current_best_scores_updated_avg),4))
+        
         # compute primal or dual weights on the entire dataset (nocv)
         if return_weights is not None:
             update_indices = backend.flatnonzero(mask)
@@ -354,6 +375,10 @@ def solve_multiple_kernel_ridge_random_search(
                 del dual_weights
             del update_indices
         del K, mask
+        
+        if patience >= patience_limit:
+            print("Ending hyperparameter tuning")
+            break
     # End of main loop
     ###########################################################################
 

@@ -167,7 +167,19 @@ def solve_group_ridge_random_search(
         n_targets_batch_refit = n_targets_batch
     #if n_alphas_batch is None:
     #    n_alphas_batch = len(alphas)
-
+    
+     # for out of sample r2, higher scores are better 
+    if compute_r2_os:
+        best_cv_score = -np.inf
+    # otherwise, if using -L2_loss then lower is better
+    else:
+        best_cv_score = np.inf
+    
+    # end tuning hyperparameters if no improvement after 
+    # patience_limit number of iterations 
+    patience = 0
+    patience_limit = 50
+    
     cv = check_cv(cv, Y)
     n_splits = cv.get_n_splits()
     for train, val in cv.split(Y):
@@ -217,8 +229,7 @@ def solve_group_ridge_random_search(
         
         split_size = []
         
-        
-        
+    
         for jj, (train, test) in enumerate(cv.split(X_)):
             
             train = backend.to_gpu(train, device=device)
@@ -229,10 +240,6 @@ def solve_group_ridge_random_search(
                 Xtrain_mean = X_[train].mean(0)
                 Xtrain = X_[train] - Xtrain_mean
                 Xtest = X_[test] - Xtrain_mean
-
-            if torch.any(torch.isnan(X_)) and save_nan_gamma:
-                torch.save(gamma, f'/home3/ebrahim/what-is-brainscore/debugging_him/gamma_nan.pt')
-                save_nan_gamma = False
                 
             # add size of split for computing pooled out of sample R2 
             split_size.append(Xtest.shape[0])
@@ -290,6 +297,10 @@ def solve_group_ridge_random_search(
 
         cv_scores[ii, :] = backend.to_cpu(cv_scores_ii)
         
+        # store mean of current_best_scores across voxels
+        # to track how much improvement is occurring 
+        current_best_scores_avg = current_best_scores.mean()
+        
         # update best_gammas and best_alphas
         epsilon = np.finfo(_dtype_to_str(dtype)).eps
         mask = cv_scores_ii > current_best_scores + epsilon
@@ -297,13 +308,21 @@ def solve_group_ridge_random_search(
         best_gammas[:, mask] = gamma[:, None]
         best_alphas[mask] = alphas[alphas_argmax[mask]]
         
+        # keep track of when the difference in performance is leveling off
+        current_best_scores_updated_avg = current_best_scores.mean()
+        performance_difference = float(current_best_scores_updated_avg) - float(current_best_scores_avg)
+        
+        if performance_difference < 1e-3: # using an arbitrary, small threshold
+            patience += 1
+        else:
+            patience = 0 
+        
         # compute primal or dual weights on the entire dataset (nocv)
         if return_weights:
             update_indices = backend.flatnonzero(mask)
             if Y_in_cpu:
                 update_indices = backend.to_cpu(update_indices)
             if len(update_indices) > 0:
-
                 # refit weights only for alphas used by at least one target
                 used_alphas = backend.unique(best_alphas[mask])
                 primal_weights = backend.zeros_like(
@@ -364,10 +383,15 @@ def solve_group_ridge_random_search(
             del update_indices
         del mask
 
-        #for kk in range(n_spaces):
-        #    X_[:, slices[kk]] /= backend.sqrt(gamma[kk])
         X_ = X_original.clone().detach()
-
+        
+        if patience >= patience_limit:
+            print("Ending hyperparameter tuning")
+            break
+        
+    # End of main loop
+    ###########################################################################
+    
     deltas = backend.log(best_gammas / best_alphas[None, :])
 
     if fit_intercept:
@@ -380,7 +404,6 @@ def solve_group_ridge_random_search(
     else:
         
         return deltas, refit_weights, cv_scores
-
 
 def _decompose_ridge(Xtrain, alphas, n_alphas_batch=None, method="svd",
                      negative_eigenvalues="zeros"):

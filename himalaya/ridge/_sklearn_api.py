@@ -342,7 +342,6 @@ class RidgeCV(Ridge):
 ###############################################################################
 ###############################################################################
 
-
 class GroupRidgeCV(_BaseRidge):
     """Group ridge regression with cross-validation.
 

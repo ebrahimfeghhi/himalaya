@@ -8,7 +8,6 @@ from ._solvers import RIDGE_SOLVERS
 from ._sklearn_api import Ridge
 from ._sklearn_api import RidgeCV
 from ._sklearn_api import GroupRidgeCV
-from ._standard_scaler_torch import StandardScaler
 
 # alternative names
 BandedRidgeCV = GroupRidgeCV
@@ -30,6 +29,4 @@ __all__ = [
     "Ridge",
     "RidgeCV",
     "GroupRidgeCV",
-    # Custom Functions
-    "StandardScaler"
 ]

@@ -5,7 +5,7 @@ from sklearn.pipeline import _name_estimators
 class ColumnTransformerNoStack(ColumnTransformer):
     """Applies transformers to columns of an array, and does not stack them.
 
-    This estimator allows different columns or column subsets of the input to
+    This estimator allows different columns or column subses of the input to
     be transformed separately. The different groups of features generated are
     *not* stacked together, to be used e.g. in a GroupRidgeCV(groups="auto").
     This is useful to perform separate transformations on different feature
