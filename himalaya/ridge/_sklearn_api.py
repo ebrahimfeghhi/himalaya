@@ -343,6 +343,7 @@ class RidgeCV(Ridge):
 ###############################################################################
 
 class GroupRidgeCV(_BaseRidge):
+    
     """Group ridge regression with cross-validation.
 
     Solve the group-regularized ridge regression::
@@ -485,7 +486,6 @@ class GroupRidgeCV(_BaseRidge):
         self.dtype_ = _get_string_dtype(Xs[0])
         device = "cpu" if self.Y_in_cpu else None
         y = check_array(y, dtype=self.dtype_, ndim=[1, 2], device=device)
-
         if any([Xi.shape[0] != y.shape[0] for Xi in Xs]):
             raise ValueError("Inconsistent number of samples.")
 

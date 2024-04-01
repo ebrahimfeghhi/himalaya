@@ -168,13 +168,6 @@ def solve_group_ridge_random_search(
     #if n_alphas_batch is None:
     #    n_alphas_batch = len(alphas)
     
-     # for out of sample r2, higher scores are better 
-    if compute_r2_os:
-        best_cv_score = -np.inf
-    # otherwise, if using -L2_loss then lower is better
-    else:
-        best_cv_score = np.inf
-    
     # end tuning hyperparameters if no improvement after 
     # patience_limit number of iterations 
     patience = 0
@@ -209,7 +202,6 @@ def solve_group_ridge_random_search(
                                            device="cpu")
         
     X_original = X_.clone().detach()
-    save_nan_gamma = True
     
     for ii, gamma in enumerate(
             bar(gammas, '%d random sampling with cv' % len(gammas),
@@ -243,7 +235,6 @@ def solve_group_ridge_random_search(
                 
             # add size of split for computing pooled out of sample R2 
             split_size.append(Xtest.shape[0])
-
             for matrix, alpha_batch in _decompose_ridge(
                     Xtrain=Xtrain, alphas=alphas, negative_eigenvalues="nan",
                     n_alphas_batch=n_alphas_batch, method=diagonalize_method):
@@ -312,7 +303,7 @@ def solve_group_ridge_random_search(
         current_best_scores_updated_avg = current_best_scores.mean()
         performance_difference = float(current_best_scores_updated_avg) - float(current_best_scores_avg)
         
-        if performance_difference < 1e-3: # using an arbitrary, small threshold
+        if performance_difference < 1e-4: # using an arbitrary, small threshold (0.0001, or a 0.01% increase in R2_os)
             patience += 1
         else:
             patience = 0 
@@ -329,7 +320,7 @@ def solve_group_ridge_random_search(
                     X_, shape=(n_features, len(update_indices)), device="cpu")
                 
                 if n_alphas_batch is not None:
-                    alphas_batch_refit = min(used_alphas, n_alphas_batch)
+                    alphas_batch_refit = min(len(used_alphas), n_alphas_batch)
                 else:
                     alphas_batch_refit = None
                     
@@ -382,7 +373,10 @@ def solve_group_ridge_random_search(
                 del primal_weights
             del update_indices
         del mask
-
+        
+        #for kk in range(n_spaces):
+        #    X_[:, slices[kk]] /= backend.sqrt(gamma[kk])
+            
         X_ = X_original.clone().detach()
         
         if patience >= patience_limit:
@@ -391,7 +385,6 @@ def solve_group_ridge_random_search(
         
     # End of main loop
     ###########################################################################
-    
     deltas = backend.log(best_gammas / best_alphas[None, :])
 
     if fit_intercept:
@@ -485,7 +478,7 @@ def _decompose_ridge(Xtrain, alphas, n_alphas_batch=None, method="svd",
             else:
                 raise ValueError("Unknown negative_eigenvalues=%r." %
                                  (negative_eigenvalues, ))
-
+                
         matrices = backend.matmul(Vt.T, ev_weighting[:, :, None] * U.T)
         
         if use_alpha_batch:

@@ -151,7 +151,7 @@ def solve_multiple_kernel_ridge_random_search(
         n_alphas_batch = len(alphas)
         
     patience = 0
-    patience_limit = 100
+    patience_limit = 50
     performance_diff_tracker = []
 
     cv = check_cv(cv, Y)
@@ -214,6 +214,11 @@ def solve_multiple_kernel_ridge_random_search(
         else:
             K = (gamma[:, None, None] * Ks).sum(0)
             
+        if backend.any(backend.isnan(K)):
+            print("Skipping gamma because it leads to nan")
+            print(gamma)
+            continue
+        
         if jitter_alphas:
             noise = backend.asarray_like(random_generator.rand(), alphas)
             alphas = given_alphas * (10 ** (noise - 0.5))
@@ -224,8 +229,7 @@ def solve_multiple_kernel_ridge_random_search(
                                     shape=(n_splits, len(alphas), n_targets))
         
         split_size = []
-        
-        
+
         for jj, (train, test) in enumerate(cv.split(K)):
             train = backend.to_gpu(train, device=device)
             test = backend.to_gpu(test, device=device)
@@ -303,7 +307,7 @@ def solve_multiple_kernel_ridge_random_search(
         current_best_scores_updated_avg = current_best_scores.mean()
         performance_difference = float(current_best_scores_updated_avg) - float(current_best_scores_avg)
         
-        if performance_difference < 1e-3: # using an arbitrary, small threshold
+        if performance_difference < 1e-4: # using an arbitrary, small threshold
             patience += 1
         else:
             patience = 0 
@@ -435,12 +439,17 @@ def _select_best_alphas(scores, alphas, local_alpha, conservative, split_size=No
     
     backend = get_backend()
     
+    def transpose_3d(tensor):
+        
+        return tensor.permute(*backend.arange(tensor.ndim - 1, -1, -1))
+    
     if compute_r2_os:
         split_size_tf = backend.asarray(split_size)/backend.sum(backend.asarray(split_size))
-        scores_weighted = scores.T*split_size_tf
-        scores_intercept_weighted = scores_intercept.T*split_size_tf
-        scores_mean = backend.sum(scores_weighted.T, axis=0)
-        scores_intercept_mean = backend.sum(scores_intercept_weighted.T, axis=0)
+        # fancy way to transpose a matrix
+        scores_weighted = transpose_3d(scores)*split_size_tf
+        scores_intercept_weighted = transpose_3d(scores_intercept)*split_size_tf
+        scores_mean = backend.sum(transpose_3d(scores_weighted), axis=0)
+        scores_intercept_mean = backend.sum(transpose_3d(scores_intercept_weighted), axis=0)
         scores_mean = 1 - scores_mean/scores_intercept_mean
         scores_mean[scores_intercept_mean==0] = 0
         scores_mean += (backend.log(alphas) * 1e-10)[:, None]
@@ -592,11 +601,13 @@ def _decompose_kernel_ridge(Ktrain, alphas, Ktest=None, n_alphas_batch=None,
         n_alphas_batch = len(alphas)
 
     if method == "eigh":
-        # diagonalization: K = V @ np.diag(eigenvalues) @ V.T
+        
         eigenvalues, V = backend.eigh(Ktrain)
+
         # match SVD notations: K = U @ np.diag(eigenvalues) @ Vt
         U = V
         Vt = V.T
+        
     elif method == "svd":
         # SVD: K = U @ np.diag(eigenvalues) @ Vt
         U, eigenvalues, Vt = backend.svd(Ktrain)
