@@ -261,7 +261,6 @@ class KernelRidge(_BaseKernelRidge):
         backend = get_backend()
         accept_sparse = False if self.kernel == "precomputed" else ("csr",
                                                                     "csc")
-        X = X.squeeze()
         X = check_array(X, dtype=self.dtype_, accept_sparse=accept_sparse,
                         ndim=2)
         if X.shape[1] != self.n_features_in_:
@@ -471,7 +470,7 @@ class KernelRidgeCV(KernelRidge):
         self : returns an instance of self.
         """
         backend = get_backend()
-        X = X.squeeze()
+
         X = check_array(X, accept_sparse=("csr", "csc"), ndim=2)
         self.dtype_ = _get_string_dtype(X)
         device = "cpu" if self.Y_in_cpu else None
