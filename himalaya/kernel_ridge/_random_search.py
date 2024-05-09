@@ -21,7 +21,8 @@ def solve_multiple_kernel_ridge_random_search(
         Xs=None, local_alpha=True, jitter_alphas=False, random_state=None,
         n_targets_batch=None, n_targets_batch_refit=None, n_alphas_batch=None,
         progress_bar=True, Ks_in_cpu=False, conservative=False, Y_in_cpu=False,
-        diagonalize_method="eigh", return_alphas=False, compute_r2_os=True):
+        diagonalize_method="eigh", return_alphas=False, compute_r2_os=True, 
+        early_stop_y_idxs=None):
     
     """Solve multiple kernel ridge regression using random search.
     Parameters
@@ -106,12 +107,21 @@ def solve_multiple_kernel_ridge_random_search(
         Intercept. Only returned when fit_intercept is True.
     """
     backend = get_backend()
+    def generate_binary_vectors(length):
+        from itertools import product
+        return list(product([0, 1], repeat=length))
+    
     if isinstance(n_iter, int):
         gammas = generate_dirichlet_samples(n_samples=n_iter,
                                             n_kernels=len(Ks),
                                             concentration=concentration,
                                             random_state=random_state)
-        gammas[0] = 1 / len(Ks)
+        #gammas[0] = 1 / len(Ks)
+        all_binary = generate_binary_vectors(len(Ks))
+        for i, l in enumerate(all_binary[1:]):
+            if np.sum(l) != 0:
+                gammas[i] = backend.asarray(l/np.sum(l))
+                
     elif n_iter.ndim == 2:
         gammas = n_iter
         assert gammas.shape[1] == Ks.shape[0]
@@ -151,8 +161,11 @@ def solve_multiple_kernel_ridge_random_search(
         n_alphas_batch = len(alphas)
         
     patience = 0
+    patience_start = len(all_binary) # don't start patience until all binary gammas are done
     patience_limit = 50
     performance_diff_tracker = []
+    if early_stop_y_idxs is None:
+        early_stop_y_idxs = np.arange(n_samples)
 
     cv = check_cv(cv, Y)
     n_splits = cv.get_n_splits()
@@ -229,7 +242,6 @@ def solve_multiple_kernel_ridge_random_search(
                                     shape=(n_splits, len(alphas), n_targets))
         
         split_size = []
-
         for jj, (train, test) in enumerate(cv.split(K)):
             train = backend.to_gpu(train, device=device)
             test = backend.to_gpu(test, device=device)
@@ -297,21 +309,22 @@ def solve_multiple_kernel_ridge_random_search(
             
         # store mean of current_best_scores across voxels
         # to track how much improvement is occurring 
-        current_best_scores_avg = current_best_scores.mean()
+        current_best_scores_avg = current_best_scores[early_stop_y_idxs].mean()
         
         current_best_scores[mask] = cv_scores_ii[mask]
         best_gammas[:, mask] = gamma[:, None]
         best_alphas[mask] = alphas[alphas_argmax[mask]]
         
         # keep track of when the difference in performance is leveling off
-        current_best_scores_updated_avg = current_best_scores.mean()
+        current_best_scores_updated_avg = current_best_scores[early_stop_y_idxs].mean()
         performance_difference = float(current_best_scores_updated_avg) - float(current_best_scores_avg)
         
-        if performance_difference < 1e-4: # using an arbitrary, small threshold
-            patience += 1
-        else:
-            patience = 0 
-            
+        if ii > patience_start:
+            if performance_difference < 1e-4: # using an arbitrary, small threshold
+                patience += 1
+            else:
+                patience = 0 
+                
         performance_diff_tracker.append(round(float(current_best_scores_updated_avg),4))
         
         # compute primal or dual weights on the entire dataset (nocv)
@@ -452,7 +465,7 @@ def _select_best_alphas(scores, alphas, local_alpha, conservative, split_size=No
         scores_intercept_mean = backend.sum(transpose_3d(scores_intercept_weighted), axis=0)
         scores_mean = 1 - scores_mean/scores_intercept_mean
         scores_mean[scores_intercept_mean==0] = 0
-        scores_mean += (backend.log(alphas) * 1e-10)[:, None]
+        scores_mean += (backend.log(alphas) * 1e-10)[:, None] # n_alphas x n_targets 
     else:
         # average scores over splits
         scores_mean = backend.mean_float64(scores, axis=0)
@@ -483,6 +496,7 @@ def _select_best_alphas(scores, alphas, local_alpha, conservative, split_size=No
                                               shape=scores_mean.shape[1],
                                               fill_value=alphas_argmax)
     best_scores_mean = backend.apply_argmax(scores_mean, alphas_argmax, axis)
+
 
     return alphas_argmax, best_scores_mean
 

@@ -860,7 +860,7 @@ class MultipleKernelRidgeCV(_BaseWeightedKernelRidge):
     def __init__(self, kernels=["linear", "polynomial"], kernels_params=None,
                  solver="random_search", solver_params=None,
                  fit_intercept=False, cv=5, random_state=None, Y_in_cpu=False,
-                 force_cpu=False):
+                 force_cpu=False, early_stop_y_idxs=None):
         self.kernels = kernels
         self.kernels_params = kernels_params
         self.solver = solver
@@ -870,6 +870,7 @@ class MultipleKernelRidgeCV(_BaseWeightedKernelRidge):
         self.random_state = random_state
         self.Y_in_cpu = Y_in_cpu
         self.force_cpu = force_cpu
+        self.early_stop_y_idxs = early_stop_y_idxs
 
     @force_cpu_backend
     def fit(self, X, y=None, sample_weight=None):
@@ -886,7 +887,7 @@ class MultipleKernelRidgeCV(_BaseWeightedKernelRidge):
             Target values.
 
         sample_weight : None, or array of shape (n_samples, )
-            Individual weights for each sample, ignored if None is passed.
+            Individual weights for each sample, ignored if None is passed. 
 
         Returns
         -------
@@ -936,7 +937,7 @@ class MultipleKernelRidgeCV(_BaseWeightedKernelRidge):
         tmp = self._call_solver(Ks=Ks, Y=y, cv=cv, return_weights="dual",
                                 Xs=None, random_state=self.random_state,
                                 fit_intercept=self.fit_intercept,
-                                Y_in_cpu=self.Y_in_cpu)
+                                Y_in_cpu=self.Y_in_cpu, early_stop_y_idxs=self.early_stop_y_idxs)
 
         # ------------------ store results
         self.deltas_, self.dual_coef_, self.cv_scores_ = tmp[:3]
